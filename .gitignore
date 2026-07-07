@@ -1,0 +1,8 @@
+# Base de données locale des utilisateurs (générée au runtime)
+data/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
