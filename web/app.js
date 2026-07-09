@@ -307,8 +307,18 @@ function sendRaw(text) {
   ws.send(JSON.stringify({ type: "message", text, t: Date.now() }));
 }
 
+// Les commandes /nick, /create et /join attendent un nom sans espace (2-20 car.).
+// On normalise l'argument comme sur l'écran de login (« mon salon » -> « mon_salon »)
+// pour éviter les erreurs « nom invalide ».
+function normalizeCommand(text) {
+  const m = text.match(/^\/(nick|pseudo|create|join)\s+(.+)$/i);
+  if (!m) return text;
+  const arg = sanitizeName(m[2]);
+  return arg ? `/${m[1].toLowerCase()} ${arg}` : text;
+}
+
 function sendMessage() {
-  const text = msgInput.value.trim();
+  const text = normalizeCommand(msgInput.value.trim());
   if (!text) return;
   // /clear est traité localement en plus (réponse serveur possible aussi)
   sendRaw(text);
@@ -333,7 +343,8 @@ msgInput.addEventListener("input", () => {
 /* ---------- Boutons d'en-tête ---------- */
 
 newRoomBtn.addEventListener("click", () => {
-  const name = prompt("Nom du nouveau salon :");
-  if (name && name.trim()) sendRaw("/create " + name.trim());
+  const name = sanitizeName(prompt("Nom du nouveau salon :") || "");
+  if (name.length >= 2) sendRaw("/create " + name);
+  else if (name.length > 0) addSystemMessage("Nom de salon trop court (2 à 20 caractères).", "error");
 });
 helpBtn.addEventListener("click", () => sendRaw("/help"));

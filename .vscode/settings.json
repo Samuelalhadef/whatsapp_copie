@@ -1,0 +1,14 @@
+{
+  // Live Server surveille les fichiers du dossier et recharge la page à chaque
+  // modification. Le serveur Python écrit dans data/users.json à chaque connexion,
+  // ce qui provoquait un rechargement immédiat -> retour à l'écran de login.
+  // On demande donc à Live Server d'ignorer data/ et les fichiers .json.
+  "liveServer.settings.ignoreFiles": [
+    ".vscode/**",
+    "**/*.scss",
+    "**/*.sass",
+    "**/*.ts",
+    "data/**",
+    "**/*.json"
+  ]
+}
