@@ -1,114 +1,98 @@
-######################################################################################
-# client.py — Client terminal (bonus) pour le serveur de chat WebSocket
-#
-# Permet d'utiliser le chat directement depuis la console, avec les mêmes
-# commandes que l'interface web (/help, /msg, /join, /time, /ping, /clear, ...).
-#
-# Installation :  pip install -r requirements.txt
-# Lancement    :  python client.py
-######################################################################################
+# Client de chat en sockets (TCP)
+# Pour lancer : python client.py  (le serveur doit deja tourner)
 
-import asyncio
-import json
+import socket
+import threading
 import os
 import sys
 import time
 
-import websockets
+HOTE = "127.0.0.1"   # adresse du serveur (mettre l'ip du serveur si autre machine)
+PORT = 5000
 
-URL = os.environ.get("CHAT_URL", "ws://localhost:5000")
-
-# Couleurs ANSI (QoL terminal)
-C = {
-    "reset": "\033[0m", "gray": "\033[90m", "green": "\033[92m",
-    "red": "\033[91m", "yellow": "\033[93m", "cyan": "\033[96m",
-    "magenta": "\033[95m", "bold": "\033[1m",
-}
+# pour activer les couleurs dans la console Windows
 if os.name == "nt":
-    os.system("")  # active les codes ANSI sous Windows
+    os.system("")
+
+# on retient le moment ou on a fait /ping pour calculer la latence
+temps_ping = [0]
 
 
-def color(txt, c):
-    return f"{C.get(c,'')}{txt}{C['reset']}"
-
-
-def show(data):
-    """Affiche joliment un message reçu du serveur."""
-    t = data.get("type")
-    if t == "welcome":
-        print(color(f"✅ Connecté en tant que {data['name']} (rôle {data['role']}) "
-                    f"dans #{data['room']}", "green"))
-    elif t == "message":
-        who = color(data["name"], "cyan")
-        print(f"[{data['time']}] {who}: {data['text']}")
-    elif t == "private":
-        tag = color("🔒 privé", "magenta")
-        print(f"[{data['time']}] {tag} {data['from']} → {data['to']}: {data['text']}")
-    elif t == "system":
-        lvl = {"error": "red", "success": "green"}.get(data.get("level"), "gray")
-        print(color(data["text"], lvl))
-    elif t == "users":
-        names = ", ".join(u["name"] for u in data["users"])
-        print(color(f"👥 #{data['room']} : {names}", "gray"))
-    elif t == "rooms":
-        rs = ", ".join(f"{r['name']}({r['count']})" for r in data["rooms"])
-        print(color(f"🚪 Salons : {rs}", "gray"))
-    elif t == "pong":
-        if data.get("t"):
-            print(color(f"🏓 Latence : {int(time.time()*1000) - data['t']} ms", "yellow"))
-    elif t == "clear":
-        os.system("cls" if os.name == "nt" else "clear")
-    elif t == "nick":
-        print(color(f"✏️ Pseudo changé en {data['name']}", "green"))
-    elif t == "role":
-        print(color(f"🎖️ Nouveau rôle : {data['role']}", "green"))
-    elif t == "roomchange":
-        print(color(f"➡️ Tu es dans #{data['room']}", "cyan"))
-    elif t in ("kicked", "banned", "timeout"):
-        print(color(f"⛔ {data.get('reason', t)}", "red"))
-
-
-async def receiver(ws):
-    try:
-        async for raw in ws:
-            try:
-                show(json.loads(raw))
-            except json.JSONDecodeError:
-                pass
-    except websockets.exceptions.ConnectionClosed:
-        print(color("\n[Déconnecté du serveur]", "red"))
-
-
-async def sender(ws):
-    loop = asyncio.get_event_loop()
+def recevoir(sock):
+    # thread qui recoit les messages du serveur et les affiche
+    tampon = ""
     while True:
-        # input() bloquant exécuté dans un thread pour ne pas figer asyncio
-        text = await loop.run_in_executor(None, sys.stdin.readline)
-        if not text:
+        try:
+            morceau = sock.recv(1024)
+        except:
             break
-        text = text.rstrip("\n")
-        if not text:
-            continue
-        if text in ("/quit", "/exit"):
-            await ws.close()
+        if not morceau:
+            print("\033[91mDeconnecte du serveur.\033[0m")
             break
-        await ws.send(json.dumps({"type": "message", "text": text, "t": int(time.time() * 1000)}))
+        tampon += morceau.decode("utf-8", "ignore")
+        while "\n" in tampon:
+            ligne, tampon = tampon.split("\n", 1)
+            if ligne == "PONG":
+                # le serveur a repondu a notre /ping : on calcule le temps
+                latence = int((time.time() - temps_ping[0]) * 1000)
+                print("\033[93mPing : " + str(latence) + " ms\033[0m")
+            elif ligne != "":
+                print(ligne)
 
 
-async def main():
-    name = input("Choisis ton pseudo : ").strip()
-    print(color(f"Connexion à {URL} ...", "gray"))
+def main():
+    pseudo = input("Choisis ton pseudo : ").strip()
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        async with websockets.connect(URL) as ws:
-            await ws.send(json.dumps({"type": "join", "name": name}))
-            print(color("Tape /help pour les commandes, /quit pour partir.\n", "gray"))
-            await asyncio.gather(receiver(ws), sender(ws))
-    except (OSError, websockets.exceptions.WebSocketException) as e:
-        print(color(f"Connexion impossible : {e}. Le serveur est-il lancé ?", "red"))
+        sock.connect((HOTE, PORT))
+    except:
+        print("Impossible de se connecter. Le serveur est-il lance ?")
+        return
+
+    # on envoie notre pseudo en premier
+    sock.send((pseudo + "\n").encode("utf-8"))
+
+    # on lance la reception dans un thread pour afficher en meme temps qu'on ecrit
+    t = threading.Thread(target=recevoir, args=(sock,))
+    t.daemon = True
+    t.start()
+
+    print("Connecte ! Tape /help pour l'aide, /quit pour partir.")
+
+    # boucle principale : on lit ce que l'utilisateur ecrit
+    while True:
+        try:
+            texte = sys.stdin.readline()
+        except:
+            break
+        if not texte:
+            break
+        texte = texte.strip()
+        if texte == "":
+            continue
+
+        # /quit : on quitte
+        if texte == "/quit":
+            break
+        # /clear : on efface l'ecran (cote client)
+        if texte == "/clear":
+            os.system("cls" if os.name == "nt" else "clear")
+            continue
+        # /ping : on note l'heure avant d'envoyer pour mesurer la latence
+        if texte == "/ping":
+            temps_ping[0] = time.time()
+
+        # on envoie le message au serveur
+        try:
+            sock.send((texte + "\n").encode("utf-8"))
+        except:
+            print("Erreur d'envoi.")
+            break
+
+    sock.close()
+    print("A bientot !")
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\nAu revoir !")
+    main()

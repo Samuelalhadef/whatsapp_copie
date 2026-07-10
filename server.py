@@ -1,646 +1,505 @@
-######################################################################################
-# server.py — Serveur de chat WebSocket complet (façon WhatsApp)
+# Serveur de chat en sockets (TCP)
+# Projet du cours "Sockets en python"
+# Pour lancer : python server.py
 #
-# Fonctionnalités :
-#   - Connexion de plusieurs clients, échange de messages en temps réel
-#   - Déconnexion propre (ne fait pas planter les autres)
-#   - Choix / changement de pseudo, persistance dans data/users.json
-#   - Messages privés (/msg), /time, /ping, /clear, /help, /who, /rooms
-#   - Rooms/salons : créer, rejoindre, quitter
-#   - Rôles : user / moderator / admin  (+ /kick /ban /mute /setadmin ...)
-#   - Timeout d'inactivité (déconnexion automatique)
-#   - Sécurité : anti-flood, validation des entrées, bans par pseudo + IP,
-#                autorisations par rôle, jeton admin comparé en temps constant
-#
-# Installation :  pip install -r requirements.txt
-# Lancement    :  python server.py
-######################################################################################
+# Le serveur ecoute, accepte plusieurs clients (un thread par client)
+# et fait passer les messages entre eux.
 
-import asyncio
+import socket
+import threading
 import json
 import os
 import re
-import hmac
 import datetime
-import socket
 
-import websockets
-
-# ============================ CONFIGURATION ============================
-
-# None = écoute sur toutes les interfaces IPv4 ET IPv6.
-# (Sur Windows, le navigateur résout « localhost » en IPv6 ::1 : si on n'écoute
-#  qu'en IPv4 sur 0.0.0.0, la connexion est refusée et l'écran de login reste bloqué.)
-SERVER = None
+# ------------------- reglages -------------------
+HOTE = "0.0.0.0"      # 0.0.0.0 = on accepte tout le monde sur le reseau
 PORT = 5000
-FORMAT = "utf-8"
+FICHIER = "users.json"   # fichier ou on stocke les pseudos et les bans
+TIMEOUT = 300            # deconnexion automatique apres 300s sans rien ecrire
+MAX_LONGUEUR = 500       # longueur maximum d'un message (securite)
 
-DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
-USERS_FILE = os.path.join(DATA_DIR, "users.json")
+# petites couleurs pour faire joli dans la console (bonus QoL)
+VERT = "\033[92m"
+ROUGE = "\033[91m"
+JAUNE = "\033[93m"
+CYAN = "\033[96m"
+GRIS = "\033[90m"
+RESET = "\033[0m"
 
-DEFAULT_ROOM = "general"
+# les niveaux des roles pour savoir qui a le droit de faire quoi
+NIVEAU = {"user": 0, "moderator": 1, "admin": 2}
 
-# --- Sécurité ---
-ADMIN_TOKEN = os.environ.get("CHAT_ADMIN_TOKEN", "admin123")  # à changer en prod !
-MAX_MSG_LEN = 2000                 # longueur max d'un message
-NICK_RE = re.compile(r"^[A-Za-z0-9À-ÖØ-öø-ÿ_\-]{2,20}$")  # pseudo autorisé (accents OK, pas d'espace)
-FLOOD_WINDOW = 5.0                 # secondes
-FLOOD_MAX = 6                      # messages max par fenêtre avant sanction
-FLOOD_MUTE = 8.0                   # durée de mute automatique (secondes)
-IDLE_TIMEOUT = 600                 # déconnexion après X s sans activité (10 min)
-
-# --- Rôles ---
-ROLES = {"user": 0, "moderator": 1, "admin": 2}
-
-# ============================ ÉTAT EN MÉMOIRE ============================
-
-# ws -> Client
-CLIENTS = {}
-# nom_room -> set(ws)
-ROOMS = {DEFAULT_ROOM: set()}
+# ------------------- etat du serveur -------------------
+# pour chaque client connecte on garde ses infos
+clients = {}   # socket -> {"pseudo", "role", "salon", "muet", "ip"}
+salons = {"general": []}   # nom du salon -> liste des sockets dedans
+verrou = threading.Lock()  # pour ne pas modifier les listes en meme temps
 
 
-class Client:
-    """Représente une session connectée."""
-    def __init__(self, ws):
-        self.ws = ws
-        self.name = None
-        self.role = "user"
-        self.room = DEFAULT_ROOM
-        self.ip = ws.remote_address[0] if ws.remote_address else "?"
-        self.msg_times = []       # horodatages récents (anti-flood)
-        self.muted_until = 0.0    # timestamp epoch de fin de mute temporaire
-
-
-# ============================ PERSISTANCE JSON ============================
-
-def load_db():
-    """Charge la base des utilisateurs, ou en crée une vide."""
-    os.makedirs(DATA_DIR, exist_ok=True)
-    if os.path.exists(USERS_FILE):
+# ------------------- fichier json -------------------
+def charger():
+    # on lit le fichier json si il existe, sinon on part de zero
+    if os.path.exists(FICHIER):
         try:
-            with open(USERS_FILE, "r", encoding=FORMAT) as f:
-                db = json.load(f)
-        except (json.JSONDecodeError, OSError):
-            db = {}
-    else:
-        db = {}
-    db.setdefault("users", {})   # nom -> {role, muted, created}
-    db.setdefault("bans", {"names": [], "ips": []})
-    return db
+            with open(FICHIER, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except:
+            pass
+    return {"users": {}, "bans_pseudos": [], "bans_ips": []}
 
 
-def save_db(db):
-    """Écrit la base sur le disque."""
-    os.makedirs(DATA_DIR, exist_ok=True)
-    with open(USERS_FILE, "w", encoding=FORMAT) as f:
-        json.dump(db, f, ensure_ascii=False, indent=2)
+def sauver():
+    # on ecrit la base dans le fichier json
+    with open(FICHIER, "w", encoding="utf-8") as f:
+        json.dump(base, f, indent=2, ensure_ascii=False)
 
 
-DB = load_db()
+base = charger()
 
 
-def register_user(name, role="user"):
-    """Enregistre / met à jour un utilisateur dans la base."""
-    u = DB["users"].get(name, {})
-    u.setdefault("created", datetime.datetime.now().isoformat(timespec="seconds"))
-    u.setdefault("muted", False)
-    u["role"] = u.get("role", role)
-    DB["users"][name] = u
-    save_db(DB)
+def y_a_un_admin():
+    # est-ce qu'il existe deja un admin dans la base ?
+    for infos in base["users"].values():
+        if infos.get("role") == "admin":
+            return True
+    return False
 
 
-def has_admin():
-    return any(u.get("role") == "admin" for u in DB["users"].values())
-
-
-# ============================ HELPERS RÉSEAU ============================
-
-def now_hms():
-    return datetime.datetime.now().strftime("%H:%M")
-
-
-def now_loop():
-    """Horloge monotone de la boucle asyncio (pour flood / mute / idle)."""
-    return asyncio.get_event_loop().time()
-
-
-async def send(ws, payload):
+# ------------------- envoi de messages -------------------
+def envoyer(sock, texte):
+    # envoie une ligne de texte a un client
     try:
-        await ws.send(json.dumps(payload, ensure_ascii=False))
-    except websockets.exceptions.ConnectionClosed:
+        sock.send((texte + "\n").encode("utf-8"))
+    except:
         pass
 
 
-async def notify(ws, text, level="info"):
-    """Message système adressé à un seul client (info / success / error)."""
-    await send(ws, {"type": "system", "text": text, "level": level, "time": now_hms()})
+def envoyer_salon(salon, texte, sauf=None):
+    # envoie un message a tout le monde dans un salon
+    for s in list(salons.get(salon, [])):
+        if s != sauf:
+            envoyer(s, texte)
 
 
-async def broadcast_room(room, payload, exclude=None):
-    for ws in list(ROOMS.get(room, set())):
-        if ws is exclude:
-            continue
-        await send(ws, payload)
-
-
-async def system_to_room(room, text, exclude=None):
-    await broadcast_room(room, {"type": "system", "text": text, "level": "info",
-                                "time": now_hms()}, exclude=exclude)
-
-
-def find_client_by_name(name):
-    for c in CLIENTS.values():
-        if c.name and c.name.lower() == name.lower():
-            return c
+def trouver(pseudo):
+    # cherche le socket d'un client a partir de son pseudo
+    for s, infos in clients.items():
+        if infos["pseudo"].lower() == pseudo.lower():
+            return s
     return None
 
 
-async def send_room_users(room):
-    """Envoie la liste des membres (avec rôle) d'une room à ses membres."""
-    members = [{"name": CLIENTS[ws].name, "role": CLIENTS[ws].role}
-               for ws in ROOMS.get(room, set()) if ws in CLIENTS and CLIENTS[ws].name]
-    await broadcast_room(room, {"type": "users", "room": room, "users": members})
+def heure():
+    return datetime.datetime.now().strftime("%H:%M")
 
 
-async def send_rooms_list(ws=None):
-    """Envoie la liste des rooms + effectif à un client (ou à tous)."""
-    payload = {"type": "rooms",
-               "rooms": [{"name": r, "count": len(m)} for r, m in ROOMS.items()]}
-    if ws:
-        await send(ws, payload)
-    else:
-        for w in list(CLIENTS.keys()):
-            await send(w, payload)
+# ------------------- connexion d'un client -------------------
+def rejoindre(sock, ip, pseudo):
+    # verifie le pseudo et connecte le client. Renvoie True si ok.
 
-
-# ============================ AUTORISATIONS ============================
-
-def level(role):
-    return ROLES.get(role, 0)
-
-
-async def require(client, min_role):
-    """Vérifie que le client a au moins `min_role`, sinon prévient."""
-    if level(client.role) < level(min_role):
-        await notify(client.ws, f"⛔ Permission refusée : rôle « {min_role} » requis.", "error")
+    # securite : le pseudo doit etre correct (lettres, chiffres, _ ou -)
+    if not re.match(r"^[A-Za-z0-9_\-]{2,16}$", pseudo):
+        envoyer(sock, ROUGE + "Pseudo invalide (2 a 16 lettres/chiffres)." + RESET)
         return False
-    return True
 
-
-# ============================ COMMANDES ============================
-
-async def cmd_help(client, args):
-    lines = [
-        "📖 Commandes disponibles :",
-        "/help — cette aide",
-        "/nick <pseudo> — changer de pseudo",
-        "/msg <pseudo> <texte> — message privé",
-        "/who — membres de la room courante",
-        "/rooms — liste des salons",
-        "/create <salon> — créer un salon",
-        "/join <salon> — rejoindre un salon",
-        "/leave — revenir au salon général",
-        "/time — heure du serveur",
-        "/ping — latence",
-        "/clear — effacer l'affichage",
-    ]
-    if level(client.role) >= level("moderator"):
-        lines += ["— Modération —", "/kick <pseudo>", "/mute <pseudo>", "/unmute <pseudo>"]
-    if level(client.role) >= level("admin"):
-        lines += ["— Admin —", "/ban <pseudo>", "/unban <pseudo>",
-                  "/setmodo <pseudo>", "/remmodo <pseudo>",
-                  "/setadmin <pseudo>", "/remadmin <pseudo>"]
-    lines.append("/auth <jeton> — obtenir le rôle admin")
-    await notify(client.ws, "\n".join(lines), "info")
-
-
-async def cmd_time(client, args):
-    full = datetime.datetime.now().strftime("%A %d %B %Y — %H:%M:%S")
-    await notify(client.ws, f"🕐 Heure du serveur : {full}", "info")
-
-
-async def cmd_ping(client, args, t=None):
-    # Le client mesure la latence à partir du timestamp qu'il a joint.
-    await send(client.ws, {"type": "pong", "t": t})
-
-
-async def cmd_clear(client, args):
-    await send(client.ws, {"type": "clear"})
-
-
-async def cmd_nick(client, args):
-    if not args:
-        await notify(client.ws, "Usage : /nick <nouveau_pseudo>", "error")
-        return
-    new = args[0].strip()
-    if not NICK_RE.match(new):
-        await notify(client.ws, "Pseudo invalide (2-20 caractères : lettres, chiffres, _ , -).", "error")
-        return
-    if find_client_by_name(new):
-        await notify(client.ws, "Ce pseudo est déjà utilisé.", "error")
-        return
-    if new in DB["bans"]["names"]:
-        await notify(client.ws, "Ce pseudo est banni.", "error")
-        return
-    old = client.name
-    client.name = new
-    # Conserver le rôle : on migre l'entrée de la base
-    role = DB["users"].get(old, {}).get("role", client.role)
-    register_user(new, role)
-    client.role = DB["users"][new]["role"]
-    await send(client.ws, {"type": "nick", "name": new, "role": client.role})
-    await system_to_room(client.room, f"« {old} » est désormais « {new} »")
-    await send_room_users(client.room)
-
-
-async def cmd_msg(client, args):
-    if len(args) < 2:
-        await notify(client.ws, "Usage : /msg <pseudo> <message>", "error")
-        return
-    target_name = args[0]
-    text = " ".join(args[1:])[:MAX_MSG_LEN]
-    target = find_client_by_name(target_name)
-    if not target:
-        await notify(client.ws, f"Utilisateur « {target_name} » introuvable ou hors ligne.", "error")
-        return
-    payload = {"type": "private", "from": client.name, "to": target.name,
-               "text": text, "time": now_hms()}
-    await send(target.ws, payload)
-    await send(client.ws, payload)   # copie pour l'expéditeur
-
-
-async def cmd_who(client, args):
-    members = [f"{CLIENTS[ws].name} ({CLIENTS[ws].role})"
-               for ws in ROOMS.get(client.room, set()) if ws in CLIENTS]
-    await notify(client.ws, f"👥 Salon « {client.room} » : " + ", ".join(sorted(members)), "info")
-
-
-async def cmd_rooms(client, args):
-    listing = ", ".join(f"{r} ({len(m)})" for r, m in ROOMS.items())
-    await notify(client.ws, f"🚪 Salons : {listing}", "info")
-
-
-async def move_to_room(client, new_room):
-    old = client.room
-    ROOMS.get(old, set()).discard(client.ws)
-    ROOMS.setdefault(new_room, set()).add(client.ws)
-    client.room = new_room
-    await system_to_room(old, f"{client.name} a quitté le salon", exclude=None)
-    await send(client.ws, {"type": "roomchange", "room": new_room})
-    await system_to_room(new_room, f"{client.name} a rejoint le salon", exclude=client.ws)
-    await send_room_users(old)
-    await send_room_users(new_room)
-    await send_rooms_list()
-
-
-async def cmd_create(client, args):
-    if not args:
-        await notify(client.ws, "Usage : /create <nom_du_salon>", "error")
-        return
-    room = args[0].strip()
-    if not NICK_RE.match(room):
-        await notify(client.ws, "Nom de salon invalide (2-20 caractères).", "error")
-        return
-    if room in ROOMS:
-        await notify(client.ws, "Ce salon existe déjà. Utilise /join.", "error")
-        return
-    ROOMS[room] = set()
-    await notify(client.ws, f"✅ Salon « {room} » créé.", "success")
-    await move_to_room(client, room)
-
-
-async def cmd_join(client, args):
-    if not args:
-        await notify(client.ws, "Usage : /join <nom_du_salon>", "error")
-        return
-    room = args[0].strip()
-    if room not in ROOMS:
-        await notify(client.ws, "Ce salon n'existe pas. Crée-le avec /create.", "error")
-        return
-    if room == client.room:
-        await notify(client.ws, "Tu es déjà dans ce salon.", "info")
-        return
-    await move_to_room(client, room)
-
-
-async def cmd_leave(client, args):
-    if client.room == DEFAULT_ROOM:
-        await notify(client.ws, "Tu es déjà dans le salon général.", "info")
-        return
-    await move_to_room(client, DEFAULT_ROOM)
-
-
-# --- Modération / Admin ---
-
-async def cmd_kick(client, args):
-    if not await require(client, "moderator"):
-        return
-    if not args:
-        await notify(client.ws, "Usage : /kick <pseudo>", "error")
-        return
-    target = find_client_by_name(args[0])
-    if not target:
-        await notify(client.ws, "Utilisateur introuvable.", "error")
-        return
-    if level(target.role) >= level(client.role):
-        await notify(client.ws, "Tu ne peux pas expulser un membre de rôle égal ou supérieur.", "error")
-        return
-    await send(target.ws, {"type": "kicked", "reason": f"Expulsé par {client.name}"})
-    await system_to_room(target.room, f"👢 {target.name} a été expulsé par {client.name}")
-    await target.ws.close()
-
-
-async def cmd_mute(client, args):
-    if not await require(client, "moderator"):
-        return
-    if not args:
-        await notify(client.ws, "Usage : /mute <pseudo>", "error")
-        return
-    target = find_client_by_name(args[0])
-    if not target:
-        await notify(client.ws, "Utilisateur introuvable.", "error")
-        return
-    if level(target.role) >= level(client.role):
-        await notify(client.ws, "Impossible de rendre muet un rôle égal ou supérieur.", "error")
-        return
-    DB["users"].setdefault(target.name, {})["muted"] = True
-    save_db(DB)
-    await notify(target.ws, "🔇 Tu as été rendu muet par un modérateur.", "error")
-    await system_to_room(target.room, f"🔇 {target.name} a été rendu muet par {client.name}")
-
-
-async def cmd_unmute(client, args):
-    if not await require(client, "moderator"):
-        return
-    if not args:
-        await notify(client.ws, "Usage : /unmute <pseudo>", "error")
-        return
-    name = args[0]
-    if name in DB["users"]:
-        DB["users"][name]["muted"] = False
-        save_db(DB)
-    target = find_client_by_name(name)
-    if target:
-        target.muted_until = 0.0
-        await notify(target.ws, "🔊 Tu peux de nouveau parler.", "success")
-    await notify(client.ws, f"🔊 {name} n'est plus muet.", "success")
-
-
-async def cmd_ban(client, args):
-    if not await require(client, "admin"):
-        return
-    if not args:
-        await notify(client.ws, "Usage : /ban <pseudo>", "error")
-        return
-    name = args[0]
-    target = find_client_by_name(name)
-    if target and level(target.role) >= level(client.role):
-        await notify(client.ws, "Tu ne peux pas bannir un rôle égal ou supérieur.", "error")
-        return
-    if name not in DB["bans"]["names"]:
-        DB["bans"]["names"].append(name)
-    if target and target.ip not in DB["bans"]["ips"]:
-        DB["bans"]["ips"].append(target.ip)
-    save_db(DB)
-    if target:
-        await send(target.ws, {"type": "banned", "reason": f"Banni par {client.name}"})
-        await system_to_room(target.room, f"🔨 {target.name} a été banni par {client.name}")
-        await target.ws.close()
-    await notify(client.ws, f"🔨 {name} est banni.", "success")
-
-
-async def cmd_unban(client, args):
-    if not await require(client, "admin"):
-        return
-    if not args:
-        await notify(client.ws, "Usage : /unban <pseudo>", "error")
-        return
-    name = args[0]
-    if name in DB["bans"]["names"]:
-        DB["bans"]["names"].remove(name)
-        save_db(DB)
-        await notify(client.ws, f"✅ {name} n'est plus banni.", "success")
-    else:
-        await notify(client.ws, "Ce pseudo n'est pas banni.", "info")
-
-
-async def set_role(client, args, role, min_giver="admin"):
-    if not await require(client, min_giver):
-        return
-    if not args:
-        await notify(client.ws, f"Usage : /set… <pseudo>", "error")
-        return
-    name = args[0]
-    DB["users"].setdefault(name, {"created": datetime.datetime.now().isoformat(timespec='seconds'),
-                                   "muted": False})
-    DB["users"][name]["role"] = role
-    save_db(DB)
-    target = find_client_by_name(name)
-    if target:
-        target.role = role
-        await send(target.ws, {"type": "role", "role": role})
-        await notify(target.ws, f"🎖️ Ton rôle est maintenant : {role}", "success")
-        await send_room_users(target.room)
-    await notify(client.ws, f"🎖️ {name} est désormais {role}.", "success")
-
-
-async def cmd_auth(client, args):
-    """Bootstrap admin via jeton (comparaison en temps constant)."""
-    if not args:
-        await notify(client.ws, "Usage : /auth <jeton>", "error")
-        return
-    if hmac.compare_digest(args[0], ADMIN_TOKEN):
-        client.role = "admin"
-        register_user(client.name, "admin")
-        DB["users"][client.name]["role"] = "admin"
-        save_db(DB)
-        await send(client.ws, {"type": "role", "role": "admin"})
-        await notify(client.ws, "🎖️ Authentification réussie : tu es admin.", "success")
-        await send_room_users(client.room)
-    else:
-        await notify(client.ws, "⛔ Jeton invalide.", "error")
-        print(f"[SECURITE] Tentative d'auth échouée depuis {client.ip} ({client.name})")
-
-
-COMMANDS = {
-    "help": cmd_help, "aide": cmd_help,
-    "nick": cmd_nick, "pseudo": cmd_nick,
-    "msg": cmd_msg, "mp": cmd_msg, "w": cmd_msg,
-    "who": cmd_who, "rooms": cmd_rooms,
-    "create": cmd_create, "join": cmd_join, "leave": cmd_leave,
-    "time": cmd_time, "clear": cmd_clear, "help_": cmd_help,
-    "kick": cmd_kick, "mute": cmd_mute, "unmute": cmd_unmute,
-    "ban": cmd_ban, "unban": cmd_unban,
-    "setmodo": lambda c, a: set_role(c, a, "moderator"),
-    "remmodo": lambda c, a: set_role(c, a, "user"),
-    "setadmin": lambda c, a: set_role(c, a, "admin"),
-    "remadmin": lambda c, a: set_role(c, a, "user"),
-    "auth": cmd_auth,
-}
-
-
-# ============================ ANTI-FLOOD ============================
-
-def check_flood(client):
-    """Retourne True si le client peut envoyer, applique un mute auto sinon."""
-    t = now_loop()
-    if t < client.muted_until:
+    # securite : les gens bannis ne peuvent pas revenir
+    if pseudo in base["bans_pseudos"] or ip in base["bans_ips"]:
+        envoyer(sock, ROUGE + "Tu es banni de ce serveur." + RESET)
         return False
-    client.msg_times = [x for x in client.msg_times if t - x < FLOOD_WINDOW]
-    client.msg_times.append(t)
-    if len(client.msg_times) > FLOOD_MAX:
-        client.muted_until = t + FLOOD_MUTE
+
+    # on refuse deux fois le meme pseudo en meme temps
+    if trouver(pseudo) is not None:
+        envoyer(sock, ROUGE + "Ce pseudo est deja utilise." + RESET)
         return False
-    return True
 
-
-# ============================ TRAITEMENT D'UN MESSAGE ============================
-
-async def handle_text(client, text, t=None):
-    """Traite le texte d'un message : commande (/…) ou message de room."""
-    text = text.strip()
-    if not text:
-        return
-
-    # --- Commande ---
-    if text.startswith("/"):
-        parts = text[1:].split()
-        if not parts:
-            return
-        cmd = parts[0].lower()
-        args = parts[1:]
-        if cmd == "ping":
-            await cmd_ping(client, args, t=t)
-            return
-        handler = COMMANDS.get(cmd)
-        if handler:
-            await handler(client, args)
+    # on regarde si le pseudo existe deja dans le fichier (pour garder son role)
+    if pseudo in base["users"]:
+        role = base["users"][pseudo]["role"]
+    else:
+        # le tout premier inscrit devient admin, les autres sont de simples users
+        if y_a_un_admin():
+            role = "user"
         else:
-            await notify(client.ws, f"Commande inconnue : /{cmd}. Tape /help.", "error")
-        return
+            role = "admin"
+        base["users"][pseudo] = {"role": role}
+        sauver()
 
-    # --- Message normal : vérifs de sécurité ---
-    if DB["users"].get(client.name, {}).get("muted"):
-        await notify(client.ws, "🔇 Tu es muet, tu ne peux pas écrire.", "error")
-        return
-    if not check_flood(client):
-        await notify(client.ws, "🚫 Trop de messages : ralentis (anti-flood).", "error")
-        return
-    if len(text) > MAX_MSG_LEN:
-        text = text[:MAX_MSG_LEN]
+    # on ajoute le client dans nos listes
+    with verrou:
+        clients[sock] = {"pseudo": pseudo, "role": role, "salon": "general",
+                         "muet": False, "ip": ip}
+        salons["general"].append(sock)
 
-    payload = {"type": "message", "room": client.room, "name": client.name,
-               "role": client.role, "text": text, "time": now_hms(), "id": None}
-    await broadcast_room(client.room, payload)
-    print(f"[{client.room}] {client.name}: {text}")
-
-
-# ============================ CONNEXION ============================
-
-async def do_join(client, requested_name):
-    """Enregistre le pseudo, applique bans, charge le rôle."""
-    name = (requested_name or "").strip()
-
-    # Sécurité : validation du pseudo
-    if not NICK_RE.match(name):
-        await notify(client.ws, "Pseudo invalide (2-20 caractères : lettres, chiffres, _ , -).", "error")
-        return False
-    if client.ip in DB["bans"]["ips"] or name in DB["bans"]["names"]:
-        await send(client.ws, {"type": "banned", "reason": "Tu es banni de ce serveur."})
-        return False
-    if find_client_by_name(name):
-        await notify(client.ws, "Ce pseudo est déjà connecté. Choisis-en un autre.", "error")
-        return False
-
-    client.name = name
-
-    # Premier utilisateur enregistré -> admin (bootstrap)
-    role = DB["users"].get(name, {}).get("role")
-    if role is None:
-        role = "admin" if not has_admin() else "user"
-    register_user(name, role)
-    client.role = DB["users"][name]["role"]
-
-    ROOMS.setdefault(client.room, set()).add(client.ws)
-    await send(client.ws, {"type": "welcome", "name": client.name, "role": client.role,
-                           "room": client.room})
-    await system_to_room(client.room, f"{client.name} a rejoint la discussion", exclude=client.ws)
-    await send_room_users(client.room)
-    await send_rooms_list(client.ws)
-    print(f"[SERVER] {client.name} ({client.ip}) connecté — rôle {client.role}")
+    envoyer(sock, VERT + "Bienvenue " + pseudo + " ! (role : " + role + ")" + RESET)
+    envoyer(sock, GRIS + "Tape /help pour voir les commandes." + RESET)
+    envoyer_salon("general", VERT + pseudo + " a rejoint le salon." + RESET, sauf=sock)
+    print(pseudo + " connecte depuis " + ip + " (role " + role + ")")
     return True
 
 
-async def handle_client(ws):
-    """Boucle de vie d'une connexion, avec timeout d'inactivité."""
-    client = Client(ws)
-    CLIENTS[ws] = client
-    print(f"[SERVER] Nouvelle connexion : {client.ip}  (actives : {len(CLIENTS)})")
+def partir(sock):
+    # quand un client s'en va on le retire proprement (sans crash pour les autres)
+    with verrou:
+        infos = clients.get(sock)
+        if infos is None:
+            return
+        pseudo = infos["pseudo"]
+        salon = infos["salon"]
+        if sock in salons.get(salon, []):
+            salons[salon].remove(sock)
+        del clients[sock]
+    envoyer_salon(salon, JAUNE + pseudo + " a quitte le salon." + RESET)
+    print(pseudo + " deconnecte")
+    try:
+        sock.close()
+    except:
+        pass
 
+
+# ------------------- les roles -------------------
+def niveau(role):
+    return NIVEAU.get(role, 0)
+
+
+def a_le_droit(sock, role_mini):
+    # verifie que le client a au moins le role demande
+    infos = clients[sock]
+    if niveau(infos["role"]) < niveau(role_mini):
+        envoyer(sock, ROUGE + "Tu n'as pas la permission (role " + role_mini + " requis)." + RESET)
+        return False
+    return True
+
+
+# ------------------- traitement des commandes -------------------
+def traiter(sock, ligne):
+    infos = clients[sock]
+    pseudo = infos["pseudo"]
+
+    # si ce n'est pas une commande, c'est un message normal
+    if not ligne.startswith("/"):
+        # securite : on coupe les messages trop longs
+        if len(ligne) > MAX_LONGUEUR:
+            ligne = ligne[:MAX_LONGUEUR]
+        # securite : une personne rendue muette ne peut pas parler
+        if infos["muet"]:
+            envoyer(sock, ROUGE + "Tu es muet, tu ne peux pas ecrire." + RESET)
+            return
+        salon = infos["salon"]
+        message = GRIS + "[" + heure() + "] " + RESET + CYAN + pseudo + RESET + " : " + ligne
+        envoyer_salon(salon, message)
+        print("[" + salon + "] " + pseudo + " : " + ligne)
+        return
+
+    # sinon on decoupe la commande
+    morceaux = ligne.split(" ")
+    commande = morceaux[0].lower()
+    args = morceaux[1:]
+
+    if commande == "/help":
+        aide = [
+            "Commandes :",
+            "/help - cette aide",
+            "/nick <pseudo> - changer de pseudo",
+            "/msg <pseudo> <message> - message prive",
+            "/time - heure du serveur",
+            "/ping - mesurer la latence",
+            "/clear - effacer l'ecran",
+            "/who - qui est dans le salon",
+            "/rooms - liste des salons",
+            "/create <salon> - creer un salon",
+            "/join <salon> - rejoindre un salon",
+            "/leave - revenir au salon general",
+        ]
+        if niveau(infos["role"]) >= 1:
+            aide.append("--- moderateur --- /kick /mute /unmute")
+        if niveau(infos["role"]) >= 2:
+            aide.append("--- admin --- /ban /unban /setmodo /remmodo /setadmin /remadmin")
+        for l in aide:
+            envoyer(sock, l)
+
+    elif commande == "/nick":
+        if len(args) < 1:
+            envoyer(sock, "Usage : /nick <nouveau_pseudo>")
+            return
+        nouveau = args[0]
+        if not re.match(r"^[A-Za-z0-9_\-]{2,16}$", nouveau):
+            envoyer(sock, ROUGE + "Pseudo invalide." + RESET)
+            return
+        if trouver(nouveau) is not None:
+            envoyer(sock, ROUGE + "Ce pseudo est deja pris." + RESET)
+            return
+        ancien = infos["pseudo"]
+        # on garde le role et on met a jour le fichier json
+        role = base["users"].get(ancien, {}).get("role", infos["role"])
+        base["users"][nouveau] = {"role": role}
+        sauver()
+        infos["pseudo"] = nouveau
+        envoyer_salon(infos["salon"], JAUNE + ancien + " s'appelle maintenant " + nouveau + RESET)
+
+    elif commande == "/msg" or commande == "/mp":
+        if len(args) < 2:
+            envoyer(sock, "Usage : /msg <pseudo> <message>")
+            return
+        cible = trouver(args[0])
+        if cible is None:
+            envoyer(sock, ROUGE + "Ce pseudo n'est pas connecte." + RESET)
+            return
+        texte = " ".join(args[1:])
+        envoyer(cible, JAUNE + "[prive de " + pseudo + "] " + RESET + texte)
+        envoyer(sock, JAUNE + "[prive a " + args[0] + "] " + RESET + texte)
+
+    elif commande == "/time":
+        maintenant = datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+        envoyer(sock, "Heure du serveur : " + maintenant)
+
+    elif commande == "/ping":
+        # le client mesure lui meme le temps, on repond juste PONG
+        envoyer(sock, "PONG")
+
+    elif commande == "/who":
+        salon = infos["salon"]
+        noms = []
+        for s in salons.get(salon, []):
+            noms.append(clients[s]["pseudo"] + "(" + clients[s]["role"] + ")")
+        envoyer(sock, "Dans #" + salon + " : " + ", ".join(noms))
+
+    elif commande == "/rooms":
+        liste = []
+        for nom, membres in salons.items():
+            liste.append(nom + "(" + str(len(membres)) + ")")
+        envoyer(sock, "Salons : " + ", ".join(liste))
+
+    elif commande == "/create":
+        if len(args) < 1:
+            envoyer(sock, "Usage : /create <salon>")
+            return
+        nom = args[0]
+        if nom in salons:
+            envoyer(sock, ROUGE + "Ce salon existe deja." + RESET)
+            return
+        salons[nom] = []
+        envoyer(sock, VERT + "Salon " + nom + " cree." + RESET)
+        changer_salon(sock, nom)
+
+    elif commande == "/join":
+        if len(args) < 1:
+            envoyer(sock, "Usage : /join <salon>")
+            return
+        nom = args[0]
+        if nom not in salons:
+            envoyer(sock, ROUGE + "Ce salon n'existe pas (utilise /create)." + RESET)
+            return
+        changer_salon(sock, nom)
+
+    elif commande == "/leave":
+        if infos["salon"] == "general":
+            envoyer(sock, "Tu es deja dans le salon general.")
+        else:
+            changer_salon(sock, "general")
+
+    # ----- commandes de moderation -----
+    elif commande == "/kick":
+        if not a_le_droit(sock, "moderator"):
+            return
+        kick(sock, args)
+
+    elif commande == "/mute":
+        if not a_le_droit(sock, "moderator"):
+            return
+        muter(sock, args, True)
+
+    elif commande == "/unmute":
+        if not a_le_droit(sock, "moderator"):
+            return
+        muter(sock, args, False)
+
+    # ----- commandes admin -----
+    elif commande == "/ban":
+        if not a_le_droit(sock, "admin"):
+            return
+        bannir(sock, args)
+
+    elif commande == "/unban":
+        if not a_le_droit(sock, "admin"):
+            return
+        if len(args) < 1:
+            envoyer(sock, "Usage : /unban <pseudo>")
+            return
+        if args[0] in base["bans_pseudos"]:
+            base["bans_pseudos"].remove(args[0])
+            sauver()
+            envoyer(sock, VERT + args[0] + " n'est plus banni." + RESET)
+        else:
+            envoyer(sock, "Ce pseudo n'est pas banni.")
+
+    elif commande == "/setmodo":
+        changer_role(sock, args, "moderator")
+    elif commande == "/remmodo":
+        changer_role(sock, args, "user")
+    elif commande == "/setadmin":
+        changer_role(sock, args, "admin")
+    elif commande == "/remadmin":
+        changer_role(sock, args, "user")
+
+    else:
+        envoyer(sock, "Commande inconnue : " + commande + " (tape /help)")
+
+
+def changer_salon(sock, nouveau):
+    # deplace un client d'un salon a un autre
+    infos = clients[sock]
+    ancien = infos["salon"]
+    with verrou:
+        if sock in salons.get(ancien, []):
+            salons[ancien].remove(sock)
+        salons[nouveau].append(sock)
+        infos["salon"] = nouveau
+    envoyer_salon(ancien, JAUNE + infos["pseudo"] + " a quitte le salon." + RESET)
+    envoyer(sock, VERT + "Tu es maintenant dans #" + nouveau + RESET)
+    envoyer_salon(nouveau, VERT + infos["pseudo"] + " a rejoint le salon." + RESET, sauf=sock)
+
+
+def kick(sock, args):
+    if len(args) < 1:
+        envoyer(sock, "Usage : /kick <pseudo>")
+        return
+    cible = trouver(args[0])
+    if cible is None:
+        envoyer(sock, ROUGE + "Ce pseudo n'est pas connecte." + RESET)
+        return
+    # securite : on ne peut pas kick quelqu'un de role egal ou superieur
+    if niveau(clients[cible]["role"]) >= niveau(clients[sock]["role"]):
+        envoyer(sock, ROUGE + "Tu ne peux pas kick ce role." + RESET)
+        return
+    envoyer(cible, ROUGE + "Tu as ete expulse par " + clients[sock]["pseudo"] + RESET)
+    partir(cible)
+
+
+def muter(sock, args, valeur):
+    if len(args) < 1:
+        envoyer(sock, "Usage : /mute <pseudo>")
+        return
+    cible = trouver(args[0])
+    if cible is None:
+        envoyer(sock, ROUGE + "Ce pseudo n'est pas connecte." + RESET)
+        return
+    if niveau(clients[cible]["role"]) >= niveau(clients[sock]["role"]):
+        envoyer(sock, ROUGE + "Tu ne peux pas mute ce role." + RESET)
+        return
+    clients[cible]["muet"] = valeur
+    if valeur:
+        envoyer(cible, ROUGE + "Tu as ete rendu muet." + RESET)
+        envoyer(sock, VERT + args[0] + " est muet." + RESET)
+    else:
+        envoyer(cible, VERT + "Tu peux de nouveau parler." + RESET)
+        envoyer(sock, VERT + args[0] + " n'est plus muet." + RESET)
+
+
+def bannir(sock, args):
+    if len(args) < 1:
+        envoyer(sock, "Usage : /ban <pseudo>")
+        return
+    nom = args[0]
+    cible = trouver(nom)
+    if cible is not None and niveau(clients[cible]["role"]) >= niveau(clients[sock]["role"]):
+        envoyer(sock, ROUGE + "Tu ne peux pas bannir ce role." + RESET)
+        return
+    # on ajoute le pseudo (et l'ip si la personne est connectee) a la liste des bans
+    if nom not in base["bans_pseudos"]:
+        base["bans_pseudos"].append(nom)
+    if cible is not None:
+        ip = clients[cible]["ip"]
+        if ip not in base["bans_ips"]:
+            base["bans_ips"].append(ip)
+    sauver()
+    envoyer(sock, ROUGE + nom + " a ete banni." + RESET)
+    if cible is not None:
+        envoyer(cible, ROUGE + "Tu as ete banni du serveur." + RESET)
+        partir(cible)
+
+
+def changer_role(sock, args, role):
+    # seuls les admins peuvent donner des roles
+    if not a_le_droit(sock, "admin"):
+        return
+    if len(args) < 1:
+        envoyer(sock, "Usage : /set... <pseudo>")
+        return
+    nom = args[0]
+    # on met a jour le fichier json
+    if nom not in base["users"]:
+        base["users"][nom] = {"role": role}
+    else:
+        base["users"][nom]["role"] = role
+    sauver()
+    # et si la personne est connectee on change son role tout de suite
+    cible = trouver(nom)
+    if cible is not None:
+        clients[cible]["role"] = role
+        envoyer(cible, VERT + "Ton nouveau role est : " + role + RESET)
+    envoyer(sock, VERT + nom + " est maintenant " + role + RESET)
+
+
+# ------------------- boucle qui s'occupe d'un client -------------------
+def gerer_client(sock, adresse):
+    ip = adresse[0]
+    sock.settimeout(TIMEOUT)   # pour la deconnexion automatique
+    tampon = ""
+    pseudo_ok = False
     try:
         while True:
-            # --- Timeout d'inactivité ---
+            # on recoit des donnees (des bytes)
             try:
-                raw = await asyncio.wait_for(ws.recv(), timeout=IDLE_TIMEOUT)
-            except asyncio.TimeoutError:
-                await notify(ws, "⌛ Déconnecté pour inactivité.", "error")
-                await send(ws, {"type": "timeout"})
+                morceau = sock.recv(1024)
+            except socket.timeout:
+                envoyer(sock, ROUGE + "Deconnecte pour inactivite." + RESET)
                 break
+            if not morceau:
+                break   # le client est parti
 
-            try:
-                msg = json.loads(raw)
-            except (json.JSONDecodeError, TypeError):
-                continue  # entrée malformée ignorée (robustesse / sécurité)
-
-            mtype = msg.get("type")
-
-            if mtype == "join":
-                await do_join(client, msg.get("name"))
-
-            elif mtype == "message":
-                if client.name:
-                    await handle_text(client, str(msg.get("text", "")), t=msg.get("t"))
-
-            elif mtype == "typing":
-                if client.name:
-                    await broadcast_room(client.room,
-                                         {"type": "typing", "name": client.name,
-                                          "state": bool(msg.get("state"))}, exclude=ws)
-
-    except websockets.exceptions.ConnectionClosed:
+            tampon += morceau.decode("utf-8", "ignore")
+            # il peut y avoir plusieurs lignes d'un coup, on les traite une par une
+            while "\n" in tampon:
+                ligne, tampon = tampon.split("\n", 1)
+                ligne = ligne.strip()
+                if ligne == "":
+                    continue
+                if not pseudo_ok:
+                    # la toute premiere ligne envoyee est le pseudo
+                    if rejoindre(sock, ip, ligne):
+                        pseudo_ok = True
+                    else:
+                        return   # pseudo refuse, on arrete
+                else:
+                    traiter(sock, ligne)
+    except:
+        # si erreur (deconnexion brutale) on ne fait pas planter le serveur
         pass
-    except Exception as e:  # robustesse : une erreur d'un client n'affecte pas les autres
-        print(f"[SERVER] Erreur avec {client.ip} : {e!r}")
     finally:
-        CLIENTS.pop(ws, None)
-        ROOMS.get(client.room, set()).discard(ws)
-        if client.name:
-            print(f"[SERVER] {client.name} déconnecté  (actives : {len(CLIENTS)})")
-            await system_to_room(client.room, f"{client.name} a quitté la discussion")
-            await send_room_users(client.room)
-            await send_rooms_list()
-        else:
-            print(f"[SERVER] {client.ip} déconnecté sans pseudo")
+        partir(sock)
 
 
-# ============================ DÉMARRAGE ============================
+# ------------------- demarrage du serveur -------------------
+def demarrer():
+    serveur = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    # pour pouvoir relancer le serveur tout de suite sans erreur "adresse deja utilisee"
+    serveur.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    serveur.bind((HOTE, PORT))
+    serveur.listen()
+    print("Serveur demarre sur le port " + str(PORT) + " (Ctrl+C pour arreter)")
 
-async def start():
-    local_ip = socket.gethostbyname(socket.gethostname())
-    print(f"[SERVER] Base utilisateurs : {USERS_FILE}")
-    print(f"[SERVER] Serveur WebSocket sur toutes les interfaces (IPv4 + IPv6), port {PORT}")
-    print(f"[SERVER] Navigateur : ws://localhost:{PORT}  (réseau : ws://{local_ip}:{PORT})")
-    print(f"[SERVER] Jeton admin : {ADMIN_TOKEN!r}  (variable CHAT_ADMIN_TOKEN pour changer)")
-    print("[SERVER] En attente de connexions...")
-    # ping_interval : keepalive TCP intégré (détection des coupures réseau)
-    async with websockets.serve(handle_client, SERVER, PORT,
-                                 ping_interval=20, ping_timeout=20, max_size=2 ** 16):
-        await asyncio.Future()
+    while True:
+        # on attend qu'un client se connecte
+        sock, adresse = serveur.accept()
+        # on lance un thread pour ce client (comme ca on peut en gerer plusieurs)
+        t = threading.Thread(target=gerer_client, args=(sock, adresse))
+        t.daemon = True
+        t.start()
 
 
 if __name__ == "__main__":
     try:
-        asyncio.run(start())
+        demarrer()
     except KeyboardInterrupt:
-        print("\n[SERVER] Arrêt du serveur.")
+        print("\nArret du serveur.")
